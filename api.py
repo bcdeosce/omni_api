@@ -54,8 +54,6 @@ _cpu_counter = mp.Value('i', 0)
 _cpu_lock = mp.Lock()
 
 # ---------- Workers (configuração para GPU) ----------
-# Como o OmniVoice é pesado, recomendamos apenas 1 worker TTS (com modelo na GPU)
-# e vários workers de mixagem (CPU).
 TTS_WORKERS = int(os.getenv("TTS_WORKERS", 1))
 MIX_WORKERS = int(os.getenv("MIX_WORKERS", 5))
 logger.info(f"Workers: TTS={TTS_WORKERS} processo(s), Mix={MIX_WORKERS} processos")
@@ -94,8 +92,19 @@ def _init_tts_worker():
     mod._dtype = dtype
     mod._sample_rate = 24000  # taxa do OmniVoice
 
-    # Cache de áudios de referência (vozes) em RAM
-    mod._ref_audio_cache = {}
+    # PRÉ-CARREGA TODAS AS VOZES NA RAM
+    logger.info("📥 Pré-carregando todas as vozes de referência na RAM...")
+    cache = {}
+    for voice_name, ref_path in VOICE_REF_PATHS.items():
+        try:
+            audio, sr = librosa.load(str(ref_path), sr=None, mono=True)
+            audio = audio.astype(np.float32)
+            cache[voice_name] = (audio, sr)
+            logger.info(f"   ✅ '{voice_name}' ({len(audio)/sr:.1f}s)")
+        except Exception as e:
+            logger.error(f"   ❌ Falha ao carregar '{voice_name}': {e}")
+    mod._ref_audio_cache = cache
+    logger.info(f"✅ {len(cache)} vozes pré-carregadas na RAM")
 
 # ---------- Inicializador dos workers de mixagem ----------
 def _init_mix_worker():
@@ -138,22 +147,12 @@ logger.info(f"Total de vozes disponíveis: {len(VOICE_REF_PATHS)}")
 
 # ---------- Funções auxiliares para o worker TTS ----------
 def get_ref_audio(voice_name: str) -> Tuple[np.ndarray, int]:
-    """Retorna (áudio, sample_rate) da voz referência, com cache em RAM."""
+    """Retorna (áudio, sample_rate) da voz referência, já em cache."""
     mod = sys.modules['__main__']
     cache = getattr(mod, '_ref_audio_cache', {})
-    if voice_name in cache:
-        return cache[voice_name]
-    ref_path = VOICE_REF_PATHS.get(voice_name)
-    if ref_path is None:
-        raise ValueError(f"Voz '{voice_name}' não encontrada")
-    audio, sr = librosa.load(str(ref_path), sr=None, mono=True)
-    # Converte para float32 e normaliza
-    audio = audio.astype(np.float32)
-    # Salva no cache (RAM)
-    cache[voice_name] = (audio, sr)
-    mod._ref_audio_cache = cache
-    logger.info(f"📥 Voz '{voice_name}' carregada na RAM ({len(audio)/sr:.2f}s)")
-    return audio, sr
+    if voice_name not in cache:
+        raise ValueError(f"Voz '{voice_name}' não encontrada no cache")
+    return cache[voice_name]
 
 def synthesize_omnivoice(
     text: str,
@@ -170,7 +169,7 @@ def synthesize_omnivoice(
     device = mod._device
     sample_rate = mod._sample_rate
 
-    # Obtém áudio de referência
+    # Obtém áudio de referência (já em cache)
     ref_audio, ref_sr = get_ref_audio(voice_name)
     # Se a taxa da referência for diferente, resample
     if ref_sr != sample_rate:
@@ -424,7 +423,6 @@ async def synthesize(req: TTSRequest):
 
     # 2. Enviar requisição inteira para um worker TTS (apenas um, se TTS_WORKERS=1)
     loop = asyncio.get_running_loop()
-    t_enqueue = time.perf_counter()
     try:
         wav_bytes = await loop.run_in_executor(
             tts_pool,
